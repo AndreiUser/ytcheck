@@ -33,13 +33,14 @@ Or add one with `ytcheck --add @handle`.
 ## Usage
 
 ```bash
-ytcheck                 # links from the last 7 days
-ytcheck -d 2 -v         # last 2 days, with channel, date and title
+ytcheck                 # numbered titles from the last 7 days (Shorts hidden)
+ytcheck -d 2 -v         # last 2 days, with links
 ytcheck --new           # only videos not shown before
-ytcheck --play          # play them in mpv (oldest first)
-ytcheck --audio         # sound only
-ytcheck -s              # skip Shorts
-mpv $(ytcheck -d 1)     # pipe links into mpv yourself
+ytcheck -i              # pick which ones to play, e.g. "1 3 5-7"
+ytcheck -i -a           # pick, then play sound only
+ytcheck --play          # play all in mpv (oldest first)
+ytcheck -S              # include Shorts
+mpv $(ytcheck -u -d 1)  # plain links, for piping into other tools
 ```
 
 mpv keys: `Space` pause, `Enter`/`>` next, `<` previous, `←`/`→` seek, `q` quit.

@@ -8,12 +8,14 @@ Channel list: ~/.config/ytcheck/channels.txt, one entry per line, e.g.
     # lines starting with # are ignored
 
 Examples:
-    ytcheck                  # URLs of videos from the last 7 days
-    ytcheck -d 2 -v          # last 2 days, with channel / date / title
+    ytcheck                  # titles of videos from the last 7 days (no Shorts)
+    ytcheck -d 2 -v          # last 2 days, with links
     ytcheck --new            # only videos not shown before
-    ytcheck --play           # open them all in mpv as a playlist
-    ytcheck --audio          # play sound only (no video window)
-    mpv $(ytcheck -d 1)      # same, via shell
+    ytcheck --select         # pick which ones to play
+    ytcheck --select --audio # pick, then play sound only
+    ytcheck --play           # play them all in mpv
+    ytcheck --shorts         # include Shorts
+    mpv $(ytcheck -u -d 1)   # plain links, for scripts
     ytcheck --add @someone   # add a channel to the list
 """
 import argparse
@@ -134,10 +136,12 @@ def main():
     p = argparse.ArgumentParser(description="List recent videos from your YouTube channels.")
     p.add_argument("-d", "--days", type=float, default=7, help="look back N days (default 7)")
     p.add_argument("-n", "--new", action="store_true", help="only videos not shown in a previous --new run")
-    p.add_argument("-v", "--verbose", action="store_true", help="show channel, date and title")
-    p.add_argument("-p", "--play", action="store_true", help="open the videos in mpv")
-    p.add_argument("-a", "--audio", action="store_true", help="play sound only in mpv (implies --play)")
-    p.add_argument("-s", "--no-shorts", action="store_true", help="skip Shorts")
+    p.add_argument("-v", "--verbose", action="store_true", help="also show each video's link")
+    p.add_argument("-u", "--urls", action="store_true", help="print only links (for scripts / piping)")
+    p.add_argument("-i", "--select", action="store_true", help="choose which videos to play")
+    p.add_argument("-p", "--play", action="store_true", help="play all videos in mpv")
+    p.add_argument("-a", "--audio", action="store_true", help="play sound only in mpv")
+    p.add_argument("-S", "--shorts", action="store_true", help="include Shorts (hidden by default)")
     p.add_argument("-f", "--file", type=Path, default=CHANNELS_FILE, help="channel list file")
     p.add_argument("--add", metavar="CHANNEL", help="add a channel to the list and exit")
     args = p.parse_args()
@@ -172,7 +176,7 @@ def main():
 
     def safe_get(cid):
         try:
-            return get_videos(cid, args.no_shorts)
+            return get_videos(cid, not args.shorts)
         except Exception as e:
             print(f"! feed failed for {cid}: {e}", file=sys.stderr)
             return []
@@ -195,24 +199,68 @@ def main():
 
     videos.sort(key=lambda v: v["published"], reverse=True)
 
-    for v in videos:
-        if args.verbose:
-            date = v["published"].astimezone().strftime("%Y-%m-%d %H:%M")
-            print(f"{date}  {v['channel']}  |  {v['title']}\n    {v['url']}")
-        else:
+    if args.urls:
+        for v in videos:
             print(v["url"])
+    elif not videos:
+        print("No new videos.")
+    else:
+        width = len(str(len(videos)))
+        for n, v in enumerate(videos, 1):
+            date = v["published"].astimezone().strftime("%d.%m %H:%M")
+            print(f"{n:>{width}}. {v['title']}  ({v['channel']}, {date})")
+            if args.verbose:
+                print(f"{' ' * width}  {v['url']}")
 
-    if args.play or args.audio:
-        if not videos:
-            print("No new videos.", file=sys.stderr)
-        elif not shutil.which("mpv"):
-            sys.exit("mpv not found (sudo apt install mpv)")
-        else:
-            cmd = ["mpv"]
-            if args.audio:
-                # download only the audio stream, show no window
-                cmd += ["--no-video", "--ytdl-format=bestaudio/best"]
-            subprocess.run(cmd + [v["url"] for v in reversed(videos)])  # oldest first
+    if args.select and videos:
+        to_play = choose(videos)
+    elif args.play or args.audio:
+        to_play = list(reversed(videos))  # oldest first
+    else:
+        return
+
+    if not to_play:
+        return
+    if not shutil.which("mpv"):
+        sys.exit("mpv not found (sudo apt install mpv)")
+    cmd = ["mpv"]
+    if args.audio:
+        # download only the audio stream, show no window
+        cmd += ["--no-video", "--ytdl-format=bestaudio/best"]
+    subprocess.run(cmd + [v["url"] for v in to_play])
+
+
+def choose(videos):
+    """Ask which numbered videos to play, e.g. '1 3 5-7'. Enter = all, q = quit."""
+    try:
+        answer = input("\nPlay which? (e.g. 1 3 5-7, Enter = all, q = quit): ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return []
+    if answer in ("q", "quit"):
+        return []
+    if not answer:
+        return list(reversed(videos))
+    picked = []
+    for part in answer.replace(",", " ").split():
+        try:
+            if "-" in part:
+                a, b = (int(x) for x in part.split("-", 1))
+                nums = range(a, b + 1) if a <= b else range(a, b - 1, -1)
+            else:
+                nums = [int(part)]
+        except ValueError:
+            print(f"  skipping '{part}' (not a number)", file=sys.stderr)
+            continue
+        for n in nums:
+            if 1 <= n <= len(videos):
+                picked.append(videos[n - 1])
+            else:
+                print(f"  skipping {n} (no such video)", file=sys.stderr)
+    unique = {}
+    for v in picked:  # drop repeats, keep the order typed
+        unique.setdefault(v["id"], v)
+    return list(unique.values())
 
 
 if __name__ == "__main__":
