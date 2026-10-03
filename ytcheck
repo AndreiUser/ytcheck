@@ -1,0 +1,219 @@
+#!/usr/bin/env python3
+"""ytcheck - list recent videos from your YouTube channels (no API key needed).
+
+Channel list: ~/.config/ytcheck/channels.txt, one entry per line, e.g.
+    @veritasium
+    https://www.youtube.com/@3blue1brown
+    https://www.youtube.com/channel/UCsXVk37bltHxD1rDPwtNM8Q
+    # lines starting with # are ignored
+
+Examples:
+    ytcheck                  # URLs of videos from the last 7 days
+    ytcheck -d 2 -v          # last 2 days, with channel / date / title
+    ytcheck --new            # only videos not shown before
+    ytcheck --play           # open them all in mpv as a playlist
+    ytcheck --audio          # play sound only (no video window)
+    mpv $(ytcheck -d 1)      # same, via shell
+    ytcheck --add @someone   # add a channel to the list
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ytcheck"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ytcheck"
+CHANNELS_FILE = CONFIG_DIR / "channels.txt"
+ID_CACHE = CACHE_DIR / "channel_ids.json"
+SEEN_FILE = CACHE_DIR / "seen.json"
+
+NS = {
+    "a": "http://www.w3.org/2005/Atom",
+    "yt": "http://www.youtube.com/xml/schemas/2015",
+}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    # skips the EU cookie-consent redirect
+    "Cookie": "SOCS=CAI; CONSENT=YES+",
+    "Accept-Language": "en",
+}
+CID_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
+
+
+def fetch(url, timeout=15):
+    req = urllib.request.Request(url, headers=HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode("utf-8", "replace")
+
+
+def load_json(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+def save_json(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=1))
+
+
+def to_url(entry):
+    """Turn a list entry into a channel ID or a channel URL."""
+    if CID_RE.fullmatch(entry):
+        return entry
+    m = re.search(r"/channel/(UC[0-9A-Za-z_-]{22})", entry)
+    if m:
+        return m.group(1)
+    if entry.startswith("http"):
+        return entry
+    return "https://www.youtube.com/" + (entry if entry.startswith("@") else "@" + entry)
+
+
+def resolve_id(url):
+    """Find the UC... channel ID for a handle/custom URL."""
+    try:
+        html = fetch(url)
+        for pat in (r'<link rel="canonical" href="https://www\.youtube\.com/channel/(UC[\w-]{22})"',
+                    r'"externalId":"(UC[\w-]{22})"',
+                    r'"channelId":"(UC[\w-]{22})"'):
+            m = re.search(pat, html)
+            if m:
+                return m.group(1)
+    except Exception:
+        pass
+    if shutil.which("yt-dlp"):  # fallback
+        try:
+            out = subprocess.run(["yt-dlp", "-J", "--flat-playlist", "-I", "1", url],
+                                 capture_output=True, text=True, timeout=60).stdout
+            info = json.loads(out)
+            for key in ("channel_id", "id"):
+                if CID_RE.fullmatch(str(info.get(key, ""))):
+                    return info[key]
+        except Exception:
+            pass
+    return None
+
+
+def get_videos(cid, no_shorts):
+    if no_shorts:  # "UULF" uploads playlist = long-form videos only
+        url = f"https://www.youtube.com/feeds/videos.xml?playlist_id=UULF{cid[2:]}"
+    else:
+        url = f"https://www.youtube.com/feeds/videos.xml?channel_id={cid}"
+    root = ET.fromstring(fetch(url))
+    videos = []
+    for e in root.findall("a:entry", NS):
+        vid = e.findtext("yt:videoId", namespaces=NS)
+        videos.append({
+            "id": vid,
+            "url": f"https://www.youtube.com/watch?v={vid}",
+            "title": e.findtext("a:title", "", NS),
+            "channel": e.findtext("a:author/a:name", cid, NS),
+            "published": datetime.fromisoformat(e.findtext("a:published", namespaces=NS)),
+        })
+    return videos
+
+
+def read_channels(path):
+    if not path.exists():
+        sys.exit(f"No channel list found. Create {path} (one channel per line) "
+                 f"or use: ytcheck --add @handle")
+    lines = [l.strip() for l in path.read_text().splitlines()]
+    return [l for l in lines if l and not l.startswith("#")]
+
+
+def main():
+    p = argparse.ArgumentParser(description="List recent videos from your YouTube channels.")
+    p.add_argument("-d", "--days", type=float, default=7, help="look back N days (default 7)")
+    p.add_argument("-n", "--new", action="store_true", help="only videos not shown in a previous --new run")
+    p.add_argument("-v", "--verbose", action="store_true", help="show channel, date and title")
+    p.add_argument("-p", "--play", action="store_true", help="open the videos in mpv")
+    p.add_argument("-a", "--audio", action="store_true", help="play sound only in mpv (implies --play)")
+    p.add_argument("-s", "--no-shorts", action="store_true", help="skip Shorts")
+    p.add_argument("-f", "--file", type=Path, default=CHANNELS_FILE, help="channel list file")
+    p.add_argument("--add", metavar="CHANNEL", help="add a channel to the list and exit")
+    args = p.parse_args()
+
+    if args.add:
+        args.file.parent.mkdir(parents=True, exist_ok=True)
+        with args.file.open("a") as f:
+            f.write(args.add.strip() + "\n")
+        print(f"Added {args.add} to {args.file}")
+        return
+
+    entries = read_channels(args.file)
+    cache = load_json(ID_CACHE, {})
+
+    def resolve(entry):
+        target = to_url(entry)
+        if CID_RE.fullmatch(target):
+            return entry, target
+        return entry, cache.get(entry) or resolve_id(target)
+
+    with ThreadPoolExecutor(8) as ex:
+        resolved = list(ex.map(resolve, entries))
+
+    ids = []
+    for entry, cid in resolved:
+        if cid:
+            cache[entry] = cid
+            ids.append(cid)
+        else:
+            print(f"! could not resolve channel: {entry}", file=sys.stderr)
+    save_json(ID_CACHE, cache)
+
+    def safe_get(cid):
+        try:
+            return get_videos(cid, args.no_shorts)
+        except Exception as e:
+            print(f"! feed failed for {cid}: {e}", file=sys.stderr)
+            return []
+
+    with ThreadPoolExecutor(8) as ex:
+        videos = [v for vs in ex.map(safe_get, dict.fromkeys(ids)) for v in vs]
+
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+    videos = [v for v in videos if v["published"] >= cutoff]
+
+    if args.new:
+        seen = load_json(SEEN_FILE, {})
+        videos = [v for v in videos if v["id"] not in seen]
+        now = datetime.now(timezone.utc)
+        for v in videos:
+            seen[v["id"]] = now.isoformat()
+        keep_after = now - timedelta(days=90)  # prune old entries
+        seen = {k: t for k, t in seen.items() if datetime.fromisoformat(t) > keep_after}
+        save_json(SEEN_FILE, seen)
+
+    videos.sort(key=lambda v: v["published"], reverse=True)
+
+    for v in videos:
+        if args.verbose:
+            date = v["published"].astimezone().strftime("%Y-%m-%d %H:%M")
+            print(f"{date}  {v['channel']}  |  {v['title']}\n    {v['url']}")
+        else:
+            print(v["url"])
+
+    if args.play or args.audio:
+        if not videos:
+            print("No new videos.", file=sys.stderr)
+        elif not shutil.which("mpv"):
+            sys.exit("mpv not found (sudo apt install mpv)")
+        else:
+            cmd = ["mpv"]
+            if args.audio:
+                # download only the audio stream, show no window
+                cmd += ["--no-video", "--ytdl-format=bestaudio/best"]
+            subprocess.run(cmd + [v["url"] for v in reversed(videos)])  # oldest first
+
+
+if __name__ == "__main__":
+    main()
